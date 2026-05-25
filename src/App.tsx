@@ -15,8 +15,11 @@ import {
 import { BrowserMultiFormatReader } from "@zxing/browser";
 import {
   BarcodeFormat,
+  BinaryBitmap,
   DecodeHintType,
-  NotFoundException,
+  HybridBinarizer,
+  MultiFormatReader,
+  RGBLuminanceSource,
 } from "@zxing/library";
 
 /* ========================= Utils ========================= */
@@ -262,7 +265,7 @@ function useCamera() {
                 max: caps.zoom.max,
                 step: caps.zoom.step ?? 0.1,
               });
-              const z = caps.zoom.min + (caps.zoom.max - caps.zoom.min) * 0.3;
+              const z = caps.zoom.min + (caps.zoom.max - caps.zoom.min) * 0.5;
               setZoom(z);
               advanced.push({ zoom: z });
             } else {
@@ -340,36 +343,57 @@ function useCamera() {
 }
 
 /* ========================= useScanner ========================= */
+type ScanStats = {
+  bdHits: number;
+  zxHits: number;
+  attempts: number;
+  videoW: number;
+  videoH: number;
+  bdAvailable: boolean;
+  lastEngine: "BD" | "ZX" | "";
+};
+
 function useScanner({
   videoRef,
-  imageCaptureRef,
   onDetected,
 }: {
   videoRef: React.RefObject<HTMLVideoElement>;
-  imageCaptureRef: React.RefObject<any>;
   onDetected: (code: string) => void;
 }) {
   // Tunáveis
-  const DETECTION_COOLDOWN_MS = 1200; // pausa após detectar
-  const BD_INTERVAL_MS = 100; // ~10 fps
+  const DETECTION_COOLDOWN_MS = 1200;
+  const BD_INTERVAL_MS = 120; // BarcodeDetector é leve
+  const ZX_INTERVAL_MS = 250; // ZXing JS é mais pesado
+  const BD_TIMEOUT_MS = 800; // mata BD se travar
+  const ZX_MAX_W = 1280; // limita canvas pra ZXing não estourar memória
 
   const bdRef = useRef<any>(null);
+  const mfReaderRef = useRef<MultiFormatReader | null>(null);
   const [scanning, setScanning] = useState(false);
-  const lastTextRef = useRef<string>("");
-  const idleRef = useRef<number>(Date.now());
 
-  // Locks e utilitários
-  const processingRef = useRef(false);
+  // Stats expostos pra HUD
+  const [stats, setStats] = useState<ScanStats>({
+    bdHits: 0,
+    zxHits: 0,
+    attempts: 0,
+    videoW: 0,
+    videoH: 0,
+    bdAvailable: false,
+    lastEngine: "",
+  });
+  const statsRef = useRef(stats);
+  statsRef.current = stats;
+
+  const lastTextRef = useRef<string>("");
   const snoozeUntilRef = useRef(0);
 
-  // ZXing reader e controle do loop
-  const zxingReaderRef = useRef<BrowserMultiFormatReader | null>(null);
-  const zxingLoopStopRef = useRef<() => void>(() => {});
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const lumBufRef = useRef<Uint8ClampedArray | null>(null);
 
   const initBarcodeDetector = useCallback(async () => {
     const W: any = window as any;
     if (!("BarcodeDetector" in W)) return null;
-
     const desired = [
       "ean_13",
       "ean_8",
@@ -398,9 +422,10 @@ function useScanner({
     }
   }, []);
 
-  const ensureZXing = useCallback(() => {
-    if (zxingReaderRef.current) return zxingReaderRef.current;
-    const hints = new Map();
+  const ensureMfReader = useCallback(() => {
+    if (mfReaderRef.current) return mfReaderRef.current;
+    const reader = new MultiFormatReader();
+    const hints = new Map<DecodeHintType, unknown>();
     hints.set(DecodeHintType.POSSIBLE_FORMATS, [
       BarcodeFormat.EAN_13,
       BarcodeFormat.EAN_8,
@@ -409,53 +434,26 @@ function useScanner({
       BarcodeFormat.CODE_128,
       BarcodeFormat.ITF,
       BarcodeFormat.CODE_39,
+      BarcodeFormat.CODE_93,
       BarcodeFormat.CODABAR,
+      BarcodeFormat.QR_CODE,
+      BarcodeFormat.DATA_MATRIX,
     ]);
     hints.set(DecodeHintType.TRY_HARDER, true);
-    // @ts-ignore
     hints.set(DecodeHintType.ALSO_INVERTED, true);
-    // @ts-ignore
-    hints.set(DecodeHintType.ASSUME_GS1, true);
-    zxingReaderRef.current = new BrowserMultiFormatReader(hints, 150);
-    return zxingReaderRef.current;
+    reader.setHints(hints);
+    mfReaderRef.current = reader;
+    return reader;
   }, []);
 
-  const captureHQ = useCallback(async () => {
-    if (!scanning) return;
-    const ic = imageCaptureRef.current;
-    if (!ic) return;
-
-    try {
-      let blob: Blob;
-      try {
-        blob = await ic.takePhoto({ imageWidth: 1600, imageHeight: 1200 });
-      } catch {
-        blob = await ic.takePhoto();
-      }
-      const bitmap = await createImageBitmap(blob);
-
-      if (bdRef.current) {
-        try {
-          const codes = await bdRef.current.detect(bitmap);
-          if (codes?.length) {
-            const code = (codes[0].rawValue || "").trim();
-            if (code && code !== lastTextRef.current && isValidEan(code)) {
-              lastTextRef.current = code;
-              idleRef.current = Date.now();
-              snoozeUntilRef.current = Date.now() + DETECTION_COOLDOWN_MS;
-              onDetected(code);
-            }
-          }
-        } catch {}
-      }
-      bitmap.close();
-    } catch {}
-  }, [imageCaptureRef, onDetected, scanning]);
-
   useEffect(() => {
+    if (!scanning) return;
+
     let bdTimer: any = null;
-    let hqTimer: any = null;
+    let zxTimer: any = null;
     let aborted = false;
+    let bdRunning = false;
+    let zxRunning = false;
 
     const acceptCode = (code: string): boolean => {
       if (!code || code.length < 4) return false;
@@ -463,140 +461,196 @@ function useScanner({
       return isValidEan(code);
     };
 
-    // ZXing — sempre roda em paralelo com BD para máxima cobertura.
-    const startZxingLoop = () => {
-      const reader = ensureZXing();
-      let stopped = false;
-      let running = false;
-
-      const zxingLoop = async () => {
-        if (aborted || stopped || !videoRef.current) return;
-        if (Date.now() < snoozeUntilRef.current) {
-          setTimeout(zxingLoop, BD_INTERVAL_MS);
-          return;
-        }
-        if (running) {
-          setTimeout(zxingLoop, BD_INTERVAL_MS);
-          return;
-        }
-        running = true;
-        try {
-          const res = await reader.decodeOnceFromVideoElement(
-            videoRef.current!
-          );
-          const txt = res?.getText?.()?.trim?.();
-          if (txt && acceptCode(txt)) {
-            lastTextRef.current = txt;
-            idleRef.current = Date.now();
-            snoozeUntilRef.current = Date.now() + DETECTION_COOLDOWN_MS;
-            onDetected(txt);
-          }
-        } catch (err: any) {
-          if (!(err instanceof NotFoundException)) {
-            // outros erros, segue o loop
-          }
-        } finally {
-          running = false;
-          setTimeout(zxingLoop, BD_INTERVAL_MS);
-        }
-      };
-
-      zxingLoopStopRef.current = () => {
-        stopped = true;
-      };
-      zxingLoop();
+    const commit = (code: string, engine: "BD" | "ZX") => {
+      lastTextRef.current = code;
+      snoozeUntilRef.current = Date.now() + DETECTION_COOLDOWN_MS;
+      setStats((s) => ({
+        ...s,
+        bdHits: engine === "BD" ? s.bdHits + 1 : s.bdHits,
+        zxHits: engine === "ZX" ? s.zxHits + 1 : s.zxHits,
+        lastEngine: engine,
+      }));
+      onDetected(code);
     };
 
-    // BarcodeDetector — passa o <video> direto pra manter resolução nativa.
+    const bumpAttempts = () => {
+      setStats((s) => ({ ...s, attempts: s.attempts + 1 }));
+    };
+
+    const updateVideoSize = (v: HTMLVideoElement) => {
+      if (
+        statsRef.current.videoW !== v.videoWidth ||
+        statsRef.current.videoH !== v.videoHeight
+      ) {
+        setStats((s) => ({ ...s, videoW: v.videoWidth, videoH: v.videoHeight }));
+      }
+    };
+
+    const withTimeout = <T,>(p: Promise<T>, ms: number): Promise<T> =>
+      Promise.race<T>([
+        p,
+        new Promise<T>((_, reject) =>
+          setTimeout(() => reject(new Error("timeout")), ms)
+        ),
+      ]);
+
+    // BarcodeDetector — passa o video diretamente, com timeout pra não travar.
     const bdTick = async () => {
-      if (aborted || !bdRef.current || !videoRef.current) return;
+      if (aborted) return;
       if (Date.now() < snoozeUntilRef.current) {
         bdTimer = setTimeout(bdTick, BD_INTERVAL_MS);
         return;
       }
-      if (processingRef.current) {
+      if (!bdRef.current || bdRunning || !videoRef.current) {
         bdTimer = setTimeout(bdTick, BD_INTERVAL_MS);
         return;
       }
-      const v = videoRef.current!;
+      const v = videoRef.current;
       if (v.readyState < 2 || !v.videoWidth || !v.videoHeight) {
         bdTimer = setTimeout(bdTick, BD_INTERVAL_MS);
         return;
       }
-
-      processingRef.current = true;
+      bdRunning = true;
       try {
-        const codes = await bdRef.current!.detect(v);
+        updateVideoSize(v);
+        bumpAttempts();
+        const codes: any[] = await withTimeout(
+          bdRef.current.detect(v),
+          BD_TIMEOUT_MS
+        );
         if (codes?.length) {
           const code = (codes[0].rawValue || "").trim();
-          if (acceptCode(code)) {
-            lastTextRef.current = code;
-            idleRef.current = Date.now();
-            snoozeUntilRef.current = Date.now() + DETECTION_COOLDOWN_MS;
-            onDetected(code);
-          }
+          if (acceptCode(code)) commit(code, "BD");
+        }
+      } catch {
+        // timeout ou erro silencioso
+      } finally {
+        bdRunning = false;
+        bdTimer = setTimeout(bdTick, BD_INTERVAL_MS);
+      }
+    };
+
+    // ZXing low-level — desenha frame em canvas, converte pra luminância e decodifica.
+    const ensureCanvas = () => {
+      if (!canvasRef.current) {
+        canvasRef.current = document.createElement("canvas");
+        ctxRef.current = canvasRef.current.getContext("2d", {
+          willReadFrequently: true,
+        });
+      }
+      return !!ctxRef.current;
+    };
+
+    const zxDecode = (canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) => {
+      const { width: w, height: h } = canvas;
+      if (!lumBufRef.current || lumBufRef.current.length !== w * h) {
+        lumBufRef.current = new Uint8ClampedArray(w * h);
+      }
+      const lums = lumBufRef.current;
+      const img = ctx.getImageData(0, 0, w, h);
+      const px = img.data;
+      // Y' = 0.299R + 0.587G + 0.114B (aproximado por 77/150/29 / 256)
+      for (let i = 0, j = 0; j < lums.length; i += 4, j++) {
+        lums[j] = (px[i] * 77 + px[i + 1] * 150 + px[i + 2] * 29) >> 8;
+      }
+      const src = new RGBLuminanceSource(lums, w, h);
+      const bm = new BinaryBitmap(new HybridBinarizer(src));
+      const reader = ensureMfReader();
+      try {
+        return reader.decode(bm).getText();
+      } catch {
+        return null;
+      } finally {
+        reader.reset();
+      }
+    };
+
+    const zxTick = () => {
+      if (aborted) return;
+      if (Date.now() < snoozeUntilRef.current) {
+        zxTimer = setTimeout(zxTick, ZX_INTERVAL_MS);
+        return;
+      }
+      if (zxRunning || !videoRef.current) {
+        zxTimer = setTimeout(zxTick, ZX_INTERVAL_MS);
+        return;
+      }
+      const v = videoRef.current;
+      if (v.readyState < 2 || !v.videoWidth || !v.videoHeight) {
+        zxTimer = setTimeout(zxTick, ZX_INTERVAL_MS);
+        return;
+      }
+      if (!ensureCanvas()) {
+        zxTimer = setTimeout(zxTick, ZX_INTERVAL_MS);
+        return;
+      }
+      zxRunning = true;
+      try {
+        updateVideoSize(v);
+        const scale = Math.min(1, ZX_MAX_W / v.videoWidth);
+        const w = Math.max(1, Math.round(v.videoWidth * scale));
+        const h = Math.max(1, Math.round(v.videoHeight * scale));
+        const canvas = canvasRef.current!;
+        const ctx = ctxRef.current!;
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+        ctx.drawImage(v, 0, 0, w, h);
+        bumpAttempts();
+        const code = zxDecode(canvas, ctx);
+        if (code) {
+          const trimmed = code.trim();
+          if (acceptCode(trimmed)) commit(trimmed, "ZX");
         }
       } catch {
         // silencioso
       } finally {
-        processingRef.current = false;
-        bdTimer = setTimeout(bdTick, BD_INTERVAL_MS);
+        zxRunning = false;
+        zxTimer = setTimeout(zxTick, ZX_INTERVAL_MS);
       }
     };
 
     const start = async () => {
       bdRef.current = await initBarcodeDetector();
-      // Sempre roda ZXing em paralelo — fallback robusto quando BD existe mas falha.
-      startZxingLoop();
-      if (bdRef.current) {
-        bdTimer = setTimeout(bdTick, BD_INTERVAL_MS);
-      }
-
-      // HQ raríssima e só se ficou muito tempo sem detectar
-      hqTimer = setInterval(() => {
-        const idleFor = Date.now() - idleRef.current;
-        if (idleFor > 15000) captureHQ();
-      }, 8000);
+      setStats((s) => ({ ...s, bdAvailable: !!bdRef.current }));
+      if (bdRef.current) bdTimer = setTimeout(bdTick, BD_INTERVAL_MS);
+      zxTimer = setTimeout(zxTick, ZX_INTERVAL_MS);
     };
 
     const onVis = () => {
       if (document.hidden) {
-        try {
-          zxingLoopStopRef.current?.();
-        } catch {}
         clearTimeout(bdTimer);
+        clearTimeout(zxTimer);
       } else {
-        startZxingLoop();
         if (bdRef.current) bdTimer = setTimeout(bdTick, BD_INTERVAL_MS);
+        zxTimer = setTimeout(zxTick, ZX_INTERVAL_MS);
       }
     };
 
-    if (scanning) {
-      start();
-      document.addEventListener("visibilitychange", onVis);
-    }
+    start();
+    document.addEventListener("visibilitychange", onVis);
 
     return () => {
       aborted = true;
       document.removeEventListener("visibilitychange", onVis);
       clearTimeout(bdTimer);
-      clearInterval(hqTimer);
-      try {
-        zxingLoopStopRef.current?.();
-      } catch {}
+      clearTimeout(zxTimer);
     };
   }, [
     BD_INTERVAL_MS,
+    BD_TIMEOUT_MS,
     DETECTION_COOLDOWN_MS,
-    captureHQ,
-    ensureZXing,
+    ZX_INTERVAL_MS,
+    ZX_MAX_W,
+    ensureMfReader,
     initBarcodeDetector,
     onDetected,
     scanning,
     videoRef,
   ]);
 
-  return { scanning, setScanning };
+  return { scanning, setScanning, stats };
 }
 
 /* ========================= App ========================= */
@@ -641,15 +695,13 @@ export default function App() {
     zoomRange,
     zoom,
     applyZoom,
-    imageCaptureRef,
   } = useCamera();
 
   // Scanner
   const [lastCode, setLastCode] = useState<string>("");
   const [animKey, setAnimKey] = useState(0);
-  const { scanning, setScanning } = useScanner({
+  const { setScanning, stats } = useScanner({
     videoRef,
-    imageCaptureRef,
     onDetected: (code) => {
       setLastCode(code);
       fetchProduct(code);
@@ -829,6 +881,18 @@ export default function App() {
                   </span>
                 </div>
               )}
+            </div>
+
+            {/* HUD diagnóstico */}
+            <div className="absolute top-2 right-2 bg-black/60 backdrop-blur-sm px-2 py-1 rounded text-[10px] text-white font-mono leading-tight pointer-events-none">
+              <div>
+                {stats.videoW || "—"}×{stats.videoH || "—"}
+              </div>
+              <div>
+                BD{stats.bdAvailable ? "" : "✗"} ✓{stats.bdHits} | ZX ✓
+                {stats.zxHits}
+              </div>
+              <div>tentativas: {stats.attempts}</div>
             </div>
 
             {/* Overlay de gesto obrigatório */}
